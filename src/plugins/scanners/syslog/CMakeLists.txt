@@ -2,6 +2,7 @@
 add_library(
   scanner_syslog SHARED
   private/syslog.c
+  private/forwarder.c
   private/logline_mapper.c
 )
 

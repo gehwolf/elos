@@ -95,6 +95,10 @@
             "Scanner": {
                 "SyslogScanner": {
                     "SyslogPath": "/dev/log",
+                    "forwards": [
+                        "/tmp/forward1",
+                        "/tmp/forward2"
+                    ],
                     "MappingRules": {
                         "MessageCodes": {
                             "4000": ".event.source.appName 'ssh' STRCMP",

@@ -2,6 +2,10 @@
 #include <errno.h>
 #include <poll.h>
 #include <regex.h>
+#include <safu/common.h>
+#include <safu/result.h>
+#include <samconf/samconf.h>
+#include <samconf/samconf_types.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +20,7 @@
 #include "elos/event/event.h"
 #include "elos/event/event_source.h"
 #include "elos/scanner/scanner.h"
+#include "forwarder.h"
 #include "logline_mapper.h"
 #include "safu/log.h"
 
@@ -41,10 +46,12 @@ struct syslog_context {
     uint32_t status;
     elosLoglineMapper_t mapper;
     const samconfConfig_t *config;
+    elosForwarder_t forwarder;
 };
 
 static elosScannerResultE_t _setupSocket(struct syslog_context *context);
-static void _publishMessage(elosScannerSession_t *session);
+static void _readMessage(elosScannerSession_t *session, char *buffer);
+static void _publishMessage(elosScannerSession_t *session, char const *buffer);
 
 elosScannerResultE_t elosScannerInitialize(elosScannerSession_t *session, const elosScannerParam_t *param) {
     const char *filterString = NULL;
@@ -94,6 +101,12 @@ elosScannerResultE_t elosScannerInitialize(elosScannerSession_t *session, const 
         context->status |= LOGLINE_MAPPER_NEEDS_CLEANUP;
     }
 
+    samconfConfig_t const *forwards = NULL;
+    samconfConfigStatusE_t status =
+        samconfConfigGet(session->config, "/root/elos/Scanner/SyslogScanner/forwards", &forwards);
+    if (status == SAMCONF_CONFIG_OK) {
+        elosSyslogForwarderInitialze(&context->forwarder, forwards);
+    }
     return _setupSocket(context);
 }
 
@@ -103,33 +116,43 @@ elosScannerResultE_t elosScannerRun(elosScannerSession_t *session) {
         {.fd = context->socket, .events = POLLIN},
         {.fd = context->cmd, .events = POLLIN},
     };
-
-    context->running = true;
-    while (context->running) {
-        int result = poll(fds, ARRAY_SIZE(fds), -1);
-        if (result > 0) {
-            if (fds[0].revents & POLLIN) {
-                _publishMessage(session);
-            } else if (fds[1].revents & POLLIN) {
-                uint64_t command = 0;
-                result = read(context->cmd, &command, sizeof(command));
-                if (result != sizeof(command)) {
-                    safuLogErrErrno("failed to receive command event");
-                    return SCANNER_ERROR;
+    char *buffer = calloc(sizeof(char), MAX_LOG_ENTRY_SIZE);
+    if (buffer == NULL) {
+        safuLogErrErrno("Calloc input buffer failed");
+    } else {
+        context->running = true;
+        while (context->running) {
+            int result = poll(fds, ARRAY_SIZE(fds), -1);
+            if (result > 0) {
+                if (fds[0].revents & POLLIN) {
+                    _readMessage(session, buffer);
+                    _publishMessage(session, buffer);
+                    if (context->forwarder.forwardsCount > 0) {
+                        size_t length = strnlen(buffer, MAX_LOG_ENTRY_SIZE);
+                        elosSyslogForwarderForwardMessage(&context->forwarder, buffer, length);
+                    }
+                } else if (fds[1].revents & POLLIN) {
+                    uint64_t command = 0;
+                    result = read(context->cmd, &command, sizeof(command));
+                    if (result != sizeof(command)) {
+                        safuLogErrErrno("failed to receive command event");
+                        return SCANNER_ERROR;
+                    }
+                    if (command == elosScannerCmdStop) {
+                        context->running = false;
+                        break;
+                    } else {
+                        safuLogInfoF("Ignore command %lu\n", command);
+                    }
                 }
-                if (command == elosScannerCmdStop) {
-                    context->running = false;
-                    break;
-                } else {
-                    safuLogInfoF("Ignore command %lu\n", command);
-                }
+            } else if (errno == EINTR) {
+                continue;
+            } else {
+                safuLogErrErrno("polling failed, bail out");
+                return SCANNER_ERROR;
             }
-        } else if (errno == EINTR) {
-            continue;
-        } else {
-            safuLogErrErrno("polling failed, bail out");
-            return SCANNER_ERROR;
         }
+        free(buffer);
     }
 
     return SCANNER_OK;
@@ -160,11 +183,13 @@ elosScannerResultE_t elosScannerFree(elosScannerSession_t *session) {
         close(context->socket);
     }
 
-    if (context->socket > -1) {
+    if (context->cmd > -1) {
         close(context->cmd);
     }
 
     unlink(elosConfigGetElosdSyslogSocketPath(session->config));
+
+    elosSyslogForwarderDeleteMembers(&context->forwarder);
     free(session->context);
     return SCANNER_OK;
 }
@@ -191,12 +216,8 @@ static elosScannerResultE_t _setupSocket(struct syslog_context *context) {
     return SCANNER_OK;
 }
 
-static void _publishMessage(elosScannerSession_t *session) {
-    const char *filterString = NULL;
+static void _readMessage(elosScannerSession_t *session, char *buffer) {
     struct syslog_context *context = session->context;
-    char *buffer = calloc(sizeof(char), MAX_LOG_ENTRY_SIZE);
-    bool publish = true;
-
     int bytesRead = read(context->socket, buffer, MAX_LOG_ENTRY_SIZE);
     if (bytesRead == -1) {
         safuLogErrErrno("read message");
@@ -209,6 +230,12 @@ static void _publishMessage(elosScannerSession_t *session) {
     } else {
         buffer[bytesRead] = '\0';
     }
+}
+
+static void _publishMessage(elosScannerSession_t *session, const char *buffer) {
+    const char *filterString = NULL;
+    struct syslog_context *context = session->context;
+    bool publish = true;
 
     if (context->status & REGEX_FILTER_ACTIVE) {
         int retval;
@@ -240,6 +267,4 @@ static void _publishMessage(elosScannerSession_t *session) {
 
         elosEventDeleteMembers(&event);
     }
-
-    free(buffer);
 }
